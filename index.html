@@ -1,1 +1,880 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MAGMOM Inspector — VASP INCAR/POSCAR 対応表示</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>body { margin: 0; }</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef, useEffect } = React;
+// THREE はグローバル（CDN 読み込み）
 
+// ---------- パース処理 ----------
+
+function parsePOSCAR(text) {
+  const err = (msg) => ({ ok: false, error: msg });
+  if (!text.trim()) return err("POSCAR が空です");
+  const lines = text.split(/\r?\n/);
+  if (lines.length < 7) return err("POSCAR の行数が不足しています");
+
+  const tok = (s) => s.trim().split(/\s+/).filter(Boolean);
+  const line5 = tok(lines[5] ?? "");
+  const line6 = tok(lines[6] ?? "");
+
+  let species, counts, vasp4 = false;
+  const isAlpha = (t) => /^[A-Za-z]/.test(t);
+  const isNum = (t) => /^\d+$/.test(t);
+
+  if (line5.length > 0 && line5.every(isAlpha)) {
+    // VASP 5 形式: 6行目に元素記号、7行目に原子数
+    species = line5;
+    if (!line6.every(isNum) || line6.length !== species.length)
+      return err("元素記号の行と原子数の行が対応していません（6・7行目を確認してください）");
+    counts = line6.map(Number);
+  } else if (line5.every(isNum) && line5.length > 0) {
+    // VASP 4 形式: 元素記号行なし
+    vasp4 = true;
+    counts = line5.map(Number);
+    species = counts.map((_, i) => `種${i + 1}`);
+  } else {
+    return err("6行目を元素記号または原子数として解釈できませんでした");
+  }
+
+  const nions = counts.reduce((a, b) => a + b, 0);
+  if (nions === 0) return err("原子数の合計が 0 です");
+
+  // ---- 3D 表示用: 格子ベクトルと座標を読み取る ----
+  let lattice = null, positions = null, fracs = null, coordNote = null;
+  const s0 = parseFloat(tok(lines[1] || "")[0]);
+  const latRaw = [2, 3, 4].map((i) => tok(lines[i] || "").slice(0, 3).map(Number));
+  if (Number.isFinite(s0) && latRaw.every((r) => r.length === 3 && r.every(Number.isFinite))) {
+    const [A, B, Cv] = latRaw;
+    const det =
+      A[0] * (B[1] * Cv[2] - B[2] * Cv[1]) -
+      A[1] * (B[0] * Cv[2] - B[2] * Cv[0]) +
+      A[2] * (B[0] * Cv[1] - B[1] * Cv[0]);
+    // 負のスケールは目標体積を意味する（VASP の仕様）
+    const sc = s0 >= 0 ? s0 : Math.cbrt(Math.abs(s0) / Math.max(Math.abs(det), 1e-12));
+    lattice = latRaw.map((r) => r.map((x) => x * sc));
+
+    let li = vasp4 ? 6 : 7;
+    let head = (lines[li] || "").trim();
+    if (/^[Ss]/.test(head)) { li++; head = (lines[li] || "").trim(); } // Selective dynamics
+    const isCart = /^[CcKk]/.test(head);
+    li++;
+    positions = [];
+    fracs = [];
+    // Cartesian 入力用: 格子行列の逆行列（frac = cart · L⁻¹）
+    const inv3 = (M) => {
+      const d =
+        M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) -
+        M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) +
+        M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+      if (Math.abs(d) < 1e-12) return null;
+      const c = (r, cIdx) => {
+        const rs = [0, 1, 2].filter((x) => x !== r);
+        const cs = [0, 1, 2].filter((x) => x !== cIdx);
+        const m = M[rs[0]][cs[0]] * M[rs[1]][cs[1]] - M[rs[0]][cs[1]] * M[rs[1]][cs[0]];
+        return ((r + cIdx) % 2 === 0 ? 1 : -1) * m;
+      };
+      // 逆行列 = 余因子行列の転置 / 行列式
+      return [0, 1, 2].map((i) => [0, 1, 2].map((j) => c(j, i) / d));
+    };
+    const Linv = isCart ? inv3(lattice) : null;
+    for (let i = 0; i < nions; i++) {
+      const cd = tok(lines[li + i] || "").slice(0, 3).map(Number);
+      if (cd.length < 3 || cd.some((x) => !Number.isFinite(x))) {
+        positions = null;
+        fracs = null;
+        coordNote = `原子座標を ${i + 1} 個目まで読んだところで解釈できなくなりました`;
+        break;
+      }
+      if (isCart) {
+        const cart = [cd[0] * sc, cd[1] * sc, cd[2] * sc];
+        positions.push(cart);
+        fracs.push(
+          Linv
+            ? [0, 1, 2].map((k) => cart[0] * Linv[0][k] + cart[1] * Linv[1][k] + cart[2] * Linv[2][k])
+            : null
+        );
+      } else {
+        fracs.push(cd);
+        positions.push([
+          cd[0] * lattice[0][0] + cd[1] * lattice[1][0] + cd[2] * lattice[2][0],
+          cd[0] * lattice[0][1] + cd[1] * lattice[1][1] + cd[2] * lattice[2][1],
+          cd[0] * lattice[0][2] + cd[1] * lattice[1][2] + cd[2] * lattice[2][2],
+        ]);
+      }
+    }
+  } else {
+    coordNote = "格子ベクトルの行を数値として読み取れませんでした";
+  }
+
+  // 原子ごとの元素ラベルを展開
+  const atoms = [];
+  let g = 0;
+  species.forEach((sp, si) => {
+    for (let k = 0; k < counts[si]; k++) {
+      atoms.push({
+        element: sp,
+        indexInSpecies: k + 1,
+        pos: positions ? positions[g] : null,
+        frac: fracs ? fracs[g] : null,
+      });
+      g++;
+    }
+  });
+
+  return { ok: true, species, counts, nions, atoms, vasp4, lattice, positions, fracs, coordNote, comment: (lines[0] || "").trim() };
+}
+
+function stripComment(line) {
+  return line.replace(/[#!].*$/, "");
+}
+
+function parseINCAR(text) {
+  if (!text.trim()) return { ok: false, error: "INCAR が空です" };
+  const tags = {};
+  // 行ごと → コメント除去 → ';' で複数タグ分割
+  const tagCounts = {};
+  // 行末バックスラッシュ（\）による行継続を先に結合して論理行を作る
+  const logicalLines = [];
+  let buf = "";
+  text.split(/\r?\n/).forEach((raw) => {
+    const cont = raw.match(/^(.*)\\\s*$/);
+    if (cont) {
+      buf += cont[1] + " ";
+    } else {
+      logicalLines.push(buf + raw);
+      buf = "";
+    }
+  });
+  if (buf) logicalLines.push(buf);
+
+  logicalLines.forEach((raw) => {
+    const line = stripComment(raw);
+    line.split(";").forEach((part) => {
+      const m = part.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (m) {
+        const key = m[1].toUpperCase();
+        tags[key] = m[2].trim();
+        tagCounts[key] = (tagCounts[key] || 0) + 1;
+      }
+    });
+  });
+
+  const parseBool = (v) =>
+    v !== undefined && /^\.?T(RUE)?\.?$/i.test(v.trim().split(/\s+/)[0] || "");
+
+  const ispin = tags["ISPIN"] !== undefined ? parseInt(tags["ISPIN"], 10) : undefined;
+  const noncollinear = parseBool(tags["LNONCOLLINEAR"]) || parseBool(tags["LSORBIT"]);
+
+  let magmomRaw = tags["MAGMOM"];
+  let magmom = null;
+  const badTokens = [];
+  if (magmomRaw !== undefined) {
+    magmom = [];
+    // "4 * 5.0" のように * の前後に空白がある書式を正規化
+    const normalized = magmomRaw.replace(/(\d+)\s*\*\s*/g, "$1*");
+    for (const t of normalized.split(/\s+/).filter(Boolean)) {
+      const rep = t.match(/^(\d+)\*([-+]?\d*\.?\d+(?:[eEdD][-+]?\d+)?)$/);
+      if (rep) {
+        const n = parseInt(rep[1], 10);
+        const v = parseFloat(rep[2].replace(/[dD]/, "e"));
+        for (let i = 0; i < n; i++) magmom.push(v);
+      } else {
+        const v = parseFloat(t.replace(/[dD]/, "e"));
+        if (Number.isNaN(v)) {
+          badTokens.push(t); // 読めないトークンは記録して残りを読み続ける
+        } else {
+          magmom.push(v);
+        }
+      }
+    }
+  }
+  const magmomError = badTokens.length > 0
+    ? `MAGMOM 内の次のトークンを解釈できませんでした: ${badTokens.map((t) => `"${t}"`).join(", ")}。これらを除いた値のみ割り当てています。`
+    : null;
+  const duplicateMagmom = (tagCounts["MAGMOM"] || 0) > 1;
+
+  return { ok: true, tags, ispin, noncollinear, magmom, magmomRaw, magmomError, duplicateMagmom };
+}
+
+// ---------- UI 部品 ----------
+
+const C = {
+  bg: "#EEF1F4",
+  panel: "#FFFFFF",
+  ink: "#1C2530",
+  sub: "#5B6774",
+  line: "#D6DCE2",
+  up: "#C0392B",     // 正のモーメント（スピン↑）
+  down: "#2456A6",   // 負のモーメント（スピン↓）
+  zero: "#9AA4AE",
+  ok: "#1E7F4F",
+  warn: "#B07A1E",
+  err: "#B03030",
+  accent: "#1C2530",
+};
+
+const mono = "'SFMono-Regular', 'Consolas', 'Menlo', monospace";
+
+function speciesColor(i) {
+  const palette = ["#4C6EF5", "#0CA678", "#E8590C", "#AE3EC9", "#1098AD", "#D6336C", "#74B816", "#F59F00"];
+  return palette[i % palette.length];
+}
+
+function fmt(v, digits = 3) {
+  if (v === undefined || v === null) return "—";
+  const s = v.toFixed(digits);
+  return s === "-0.000" ? "0.000" : s;
+}
+
+function MomentBar({ value, maxAbs }) {
+  const half = 70;
+  const w = maxAbs > 0 ? Math.min(Math.abs(value) / maxAbs, 1) * half : 0;
+  const color = value > 1e-6 ? C.up : value < -1e-6 ? C.down : C.zero;
+  return (
+    <svg width={half * 2 + 2} height="14" style={{ display: "block" }}>
+      <line x1={half + 1} y1="0" x2={half + 1} y2="14" stroke={C.line} strokeWidth="1" />
+      {Math.abs(value) > 1e-6 ? (
+        <rect
+          x={value > 0 ? half + 1 : half + 1 - w}
+          y="3"
+          width={Math.max(w, 1.5)}
+          height="8"
+          fill={color}
+          rx="1.5"
+        />
+      ) : (
+        <circle cx={half + 1} cy="7" r="2" fill={C.zero} />
+      )}
+    </svg>
+  );
+}
+
+function Badge({ kind, children }) {
+  const color = { ok: C.ok, warn: C.warn, err: C.err }[kind];
+  return (
+    <div style={{
+      display: "flex", alignItems: "flex-start", gap: 8,
+      background: color + "14", border: `1px solid ${color}55`,
+      borderLeft: `3px solid ${color}`,
+      padding: "8px 12px", borderRadius: 6, color: C.ink, fontSize: 13, lineHeight: 1.5,
+    }}>
+      <span style={{ color, fontWeight: 700, fontFamily: mono, fontSize: 12, marginTop: 1 }}>
+        {kind === "ok" ? "OK" : kind === "warn" ? "注意" : "エラー"}
+      </span>
+      <span>{children}</span>
+    </div>
+  );
+}
+
+// 円柱＋円錐でスピン矢印を作る（ArrowHelper より太く見やすい）
+function makeArrow(dir, tail, len, color, opacity = 1.0) {
+  const grp = new THREE.Group();
+  const headLen = Math.min(0.5, len * 0.4);
+  const shaftLen = Math.max(len - headLen, 0.01);
+  const mat = new THREE.MeshLambertMaterial({ color, transparent: opacity < 1, opacity });
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, shaftLen, 12), mat);
+  shaft.position.y = shaftLen / 2;
+  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.001, 0.19, headLen, 16), mat);
+  head.position.y = shaftLen + headLen / 2;
+  grp.add(shaft);
+  grp.add(head);
+  grp.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+  grp.position.copy(tail);
+  return grp;
+}
+
+function StructureView({ poscar, assigned, ncl }) {
+  const mountRef = useRef(null);
+  const [arrowScale, setArrowScale] = useState(2.5);
+  const [showZero, setShowZero] = useState(true);
+  const [showImages, setShowImages] = useState(true);
+  const [margin, setMargin] = useState(0.06);
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount || !poscar.lattice || !poscar.positions) return;
+
+    const width = mount.clientWidth || 800;
+    const height = 460;
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(40, width / height, 0.1, 2000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    mount.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.72));
+    const dl = new THREE.DirectionalLight(0xffffff, 0.6);
+    dl.position.set(1, 1.4, 2);
+    scene.add(dl);
+
+    const [A, B, Cv] = poscar.lattice;
+    const center = [
+      (A[0] + B[0] + Cv[0]) / 2,
+      (A[1] + B[1] + Cv[1]) / 2,
+      (A[2] + B[2] + Cv[2]) / 2,
+    ];
+    const V = (p) => new THREE.Vector3(p[0] - center[0], p[1] - center[1], p[2] - center[2]);
+    const group = new THREE.Group();
+    scene.add(group);
+
+    // 単位胞の枠（12 辺）
+    const corners = [];
+    for (let i = 0; i < 8; i++) {
+      const p = [0, 0, 0];
+      [A, B, Cv].forEach((vec, bi) => {
+        if (i & (1 << bi)) { p[0] += vec[0]; p[1] += vec[1]; p[2] += vec[2]; }
+      });
+      corners.push(p);
+    }
+    const edgePts = [];
+    for (let i = 0; i < 8; i++) {
+      for (const bit of [1, 2, 4]) {
+        const j = i | bit;
+        if (j !== i) { edgePts.push(V(corners[i]), V(corners[j])); }
+      }
+    }
+    const cellGeo = new THREE.BufferGeometry().setFromPoints(edgePts);
+    group.add(new THREE.LineSegments(cellGeo, new THREE.LineBasicMaterial({ color: 0x9aa4ae })));
+
+    // 原子とスピン矢印（本体 + 境界近傍の周期像）
+    const sphereGeo = new THREE.SphereGeometry(0.3, 24, 18);
+    const drawAtom = (cart, si, isZero, ghost) => {
+      const opacity = ghost ? (isZero ? 0.22 : 0.4) : isZero ? 0.45 : 1.0;
+      const mesh = new THREE.Mesh(
+        sphereGeo,
+        new THREE.MeshLambertMaterial({
+          color: speciesColor(si),
+          transparent: opacity < 1,
+          opacity,
+        })
+      );
+      mesh.position.copy(V(cart));
+      group.add(mesh);
+    };
+    const drawSpin = (cart, vec, mag, ghost) => {
+      const dir = new THREE.Vector3(vec[0], vec[1], vec[2]).normalize();
+      const len = mag * arrowScale;
+      const tail = V(cart).sub(dir.clone().multiplyScalar(len / 2)); // 原子中心に矢印の中点を置く
+      const color = ncl ? 0xc0392b : vec[2] > 0 ? 0xc0392b : 0x2456a6;
+      group.add(makeArrow(dir, tail, len, color, ghost ? 0.45 : 1.0));
+    };
+
+    poscar.atoms.forEach((at, i) => {
+      if (!at.pos) return;
+      const raw = assigned ? assigned[i] : null;
+      const vec = raw == null ? [0, 0, 0] : ncl ? raw : [0, 0, raw];
+      const mag = Math.hypot(vec[0], vec[1], vec[2]);
+      const isZero = mag < 1e-6;
+      if (isZero && !showZero) return;
+      const si = poscar.species.indexOf(at.element);
+
+      // 本体
+      drawAtom(at.pos, si, isZero, false);
+      if (!isZero) drawSpin(at.pos, vec, mag, false);
+
+      // 周期像: 分率座標が境界から margin 以内なら隣接セル側にも複製
+      if (showImages && at.frac) {
+        for (let sx = -1; sx <= 1; sx++) {
+          for (let sy = -1; sy <= 1; sy++) {
+            for (let sz = -1; sz <= 1; sz++) {
+              if (sx === 0 && sy === 0 && sz === 0) continue;
+              const sh = [sx, sy, sz];
+              const f = [at.frac[0] + sx, at.frac[1] + sy, at.frac[2] + sz];
+              if (f.every((x) => x >= -margin && x <= 1 + margin)) {
+                const cart = [
+                  at.pos[0] + sh[0] * A[0] + sh[1] * B[0] + sh[2] * Cv[0],
+                  at.pos[1] + sh[0] * A[1] + sh[1] * B[1] + sh[2] * Cv[1],
+                  at.pos[2] + sh[0] * A[2] + sh[1] * B[2] + sh[2] * Cv[2],
+                ];
+                drawAtom(cart, si, isZero, true);
+                if (!isZero) drawSpin(cart, vec, mag, true);
+              }
+            }
+          }
+        }
+      }
+    });
+
+    const norm = (v) => Math.hypot(v[0], v[1], v[2]);
+    const extent = Math.max(norm(A), norm(B), norm(Cv), 5);
+    camera.position.set(extent * 0.8, extent * 0.6, extent * 1.8);
+    camera.lookAt(0, 0, 0);
+
+    // マウス操作: ドラッグで回転、ホイールで拡大縮小
+    let dragging = false, px = 0, py = 0;
+    const onDown = (e) => { dragging = true; px = e.clientX; py = e.clientY; };
+    const onMove = (e) => {
+      if (!dragging) return;
+      group.rotation.y += (e.clientX - px) * 0.008;
+      group.rotation.x += (e.clientY - py) * 0.008;
+      px = e.clientX; py = e.clientY;
+    };
+    const onUp = () => { dragging = false; };
+    const onWheel = (e) => {
+      e.preventDefault();
+      const f = Math.exp(e.deltaY * 0.0012);
+      const d = camera.position.length() * f;
+      camera.position.setLength(Math.min(Math.max(d, extent * 0.5), extent * 6));
+    };
+    const cv = renderer.domElement;
+    cv.style.cursor = "grab";
+    cv.addEventListener("pointerdown", onDown);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    cv.addEventListener("wheel", onWheel, { passive: false });
+
+    let raf;
+    const loop = () => { raf = requestAnimationFrame(loop); renderer.render(scene, camera); };
+    loop();
+
+    return () => {
+      cancelAnimationFrame(raf);
+      cv.removeEventListener("pointerdown", onDown);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      cv.removeEventListener("wheel", onWheel);
+      renderer.dispose();
+      if (cv.parentNode === mount) mount.removeChild(cv);
+    };
+  }, [poscar, assigned, ncl, arrowScale, showZero, showImages, margin]);
+
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 18, flexWrap: "wrap", marginBottom: 10 }}>
+        <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: "0.03em" }}>構造とスピン配置（3D）</span>
+        <label style={{ fontSize: 12, color: C.sub, display: "flex", alignItems: "center", gap: 6 }}>
+          矢印の長さ
+          <input
+            type="range" min="0.5" max="6" step="0.1" value={arrowScale}
+            onChange={(e) => setArrowScale(parseFloat(e.target.value))}
+            style={{ width: 110 }}
+          />
+          <span style={{ fontFamily: mono }}>{arrowScale.toFixed(1)} Å/μB</span>
+        </label>
+        <label style={{ fontSize: 12, color: C.sub, display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
+          <input type="checkbox" checked={showZero} onChange={(e) => setShowZero(e.target.checked)} />
+          モーメント 0 の原子も表示（半透明）
+        </label>
+        <label style={{ fontSize: 12, color: C.sub, display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
+          <input type="checkbox" checked={showImages} onChange={(e) => setShowImages(e.target.checked)} />
+          境界の周期像を表示
+        </label>
+        {showImages && (
+          <label style={{ fontSize: 12, color: C.sub, display: "flex", alignItems: "center", gap: 6 }}>
+            境界からの幅
+            <input
+              type="range" min="0.01" max="0.30" step="0.01" value={margin}
+              onChange={(e) => setMargin(parseFloat(e.target.value))}
+              style={{ width: 90 }}
+            />
+            <span style={{ fontFamily: mono }}>{margin.toFixed(2)}</span>
+            <span>（分率座標）</span>
+          </label>
+        )}
+        <span style={{ fontSize: 11.5, color: C.sub, marginLeft: "auto" }}>ドラッグで回転 / ホイールで拡大縮小</span>
+      </div>
+      <div ref={mountRef} style={{ width: "100%", borderRadius: 8, overflow: "hidden", background: "#FAFBFC", border: `1px solid ${C.line}` }} />
+      <div style={{ marginTop: 8, fontSize: 11.5, color: C.sub, display: "flex", gap: 14, flexWrap: "wrap" }}>
+        {poscar.species.map((sp, si) => (
+          <span key={si}>
+            <span style={{ display: "inline-block", width: 9, height: 9, borderRadius: "50%", background: speciesColor(si), marginRight: 5, verticalAlign: "-1px" }} />
+            {sp}
+          </span>
+        ))}
+        <span>矢印: MAGMOM ベクトル{ncl ? "（mx, my, mz）" : "（±z 方向、赤=正 / 青=負）"}</span>
+        {showImages && <span>半透明の複製 = 隣接セルの周期像</span>}
+      </div>
+    </div>
+  );
+}
+
+function FilePane({ label, hint, value, onChange }) {
+  const handleFile = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => onChange(String(r.result));
+    r.readAsText(f);
+    e.target.value = "";
+  };
+  return (
+    <div style={{ flex: 1, minWidth: 280, display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 6 }}>
+        <span style={{ fontFamily: mono, fontWeight: 700, fontSize: 14, letterSpacing: "0.05em" }}>{label}</span>
+        <label style={{
+          fontSize: 12, color: C.sub, cursor: "pointer", border: `1px solid ${C.line}`,
+          borderRadius: 5, padding: "3px 10px", background: "#fff",
+        }}>
+          ファイルを選択
+          <input type="file" onChange={handleFile} style={{ display: "none" }} />
+        </label>
+      </div>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={hint}
+        spellCheck={false}
+        style={{
+          fontFamily: mono, fontSize: 12.5, lineHeight: 1.55,
+          minHeight: 180, resize: "vertical", padding: 10,
+          border: `1px solid ${C.line}`, borderRadius: 6, background: "#fff",
+          color: C.ink, outline: "none", whiteSpace: "pre", overflowX: "auto",
+        }}
+      />
+    </div>
+  );
+}
+
+// ---------- サンプルデータ ----------
+
+const SAMPLE_POSCAR = `Fe3O4 inverse spinel (partial cell)
+1.0
+   8.396  0.000  0.000
+   0.000  8.396  0.000
+   0.000  0.000  8.396
+  Fe  O
+   4   8
+Direct
+  0.000 0.000 0.000
+  0.250 0.250 0.250
+  0.500 0.500 0.000
+  0.750 0.750 0.250
+  0.125 0.125 0.125
+  0.375 0.375 0.125
+  0.625 0.625 0.125
+  0.875 0.875 0.125
+  0.125 0.375 0.375
+  0.375 0.125 0.375
+  0.625 0.875 0.375
+  0.875 0.625 0.375`;
+
+const SAMPLE_INCAR = `SYSTEM = Fe3O4
+ISPIN  = 2
+MAGMOM = 2*4.0 2*-4.0 8*0.0   ! Fe(A)↑ Fe(B)↓ O
+ENCUT  = 520
+ISMEAR = 0 ; SIGMA = 0.05`;
+
+// ---------- メイン ----------
+
+function MagmomViewer() {
+  const [poscarText, setPoscarText] = useState("");
+  const [incarText, setIncarText] = useState("");
+
+  const poscar = useMemo(() => parsePOSCAR(poscarText), [poscarText]);
+  const incar = useMemo(() => parseINCAR(incarText), [incarText]);
+
+  const analysis = useMemo(() => {
+    if (!poscar.ok || !incar.ok) return null;
+    const ncl = incar.noncollinear;
+    const per = ncl ? 3 : 1;
+    const expected = poscar.nions * per;
+
+    const notes = [];
+    let assigned = null; // 原子ごと: number または [mx,my,mz]
+
+    if (incar.magmomError) {
+      notes.push({ kind: "err", text: incar.magmomError });
+    }
+    if (incar.duplicateMagmom) {
+      notes.push({
+        kind: "warn",
+        text: "INCAR 内で MAGMOM が複数回定義されています。最後の定義のみを使用しています（VASP も後の定義で上書きします）。意図した行が使われているか下の「読み取った MAGMOM」で確認してください。",
+      });
+    }
+    if (incar.magmom === null) {
+      notes.push({
+        kind: "warn",
+        text: `MAGMOM が INCAR にありません。ISPIN=2 の場合、VASP は既定値 NIONS*1.0（全原子 1.0 μB）を使用します。下表は既定値を表示しています。`,
+      });
+      assigned = poscar.atoms.map(() => 1.0);
+    } else if (incar.magmom.length !== expected) {
+      notes.push({
+        kind: "err",
+        text: ncl
+          ? `MAGMOM の値の数（${incar.magmom.length}）が 3×原子数（3×${poscar.nions} = ${expected}）と一致しません。非共線計算では原子ごとに 3 成分が必要です。`
+          : `MAGMOM の値の数（${incar.magmom.length}）が POSCAR の原子数（${poscar.nions}）と一致しません。VASP はこの入力でエラーになるか、意図しない割り当てになります。`,
+      });
+      // 一致しなくても、先頭から可能な範囲で割り当てを表示（原因特定のため）
+      assigned = poscar.atoms.map((_, i) => {
+        if (ncl) {
+          const s = i * 3;
+          return incar.magmom.length >= s + 3 ? incar.magmom.slice(s, s + 3) : null;
+        }
+        return i < incar.magmom.length ? incar.magmom[i] : null;
+      });
+    } else {
+      notes.push({
+        kind: "ok",
+        text: `MAGMOM の値の数（${incar.magmom.length}）は${ncl ? " 3×" : ""}原子数（${expected}）と一致しています。`,
+      });
+      assigned = poscar.atoms.map((_, i) =>
+        ncl ? incar.magmom.slice(i * 3, i * 3 + 3) : incar.magmom[i]
+      );
+    }
+
+    if (!ncl && incar.ispin !== undefined && incar.ispin !== 2) {
+      notes.push({
+        kind: "warn",
+        text: `ISPIN = ${incar.ispin} です。共線スピン分極計算（ISPIN = 2）でなければ MAGMOM は無視されます。`,
+      });
+    }
+    if (!ncl && incar.ispin === undefined && incar.magmom !== null) {
+      notes.push({
+        kind: "warn",
+        text: "ISPIN が指定されていません（既定値 1）。MAGMOM を有効にするには ISPIN = 2 が必要です。",
+      });
+    }
+    if (ncl) {
+      notes.push({
+        kind: "warn",
+        text: "LNONCOLLINEAR / LSORBIT が有効です。MAGMOM は原子ごとに (mx, my, mz) の 3 成分として解釈します。",
+      });
+    }
+    if (poscar.vasp4) {
+      notes.push({
+        kind: "warn",
+        text: "POSCAR に元素記号の行がありません（VASP 4 形式）。元素名は POTCAR の順序に対応する「種1, 種2, …」として表示しています。",
+      });
+    }
+    if (!poscar.positions) {
+      notes.push({
+        kind: "warn",
+        text: `POSCAR から原子座標を読み取れなかったため、3D 表示は省略します${poscar.coordNote ? `（${poscar.coordNote}）` : ""}。`,
+      });
+    }
+
+    // 元素種ごとの要約
+    const summary = [];
+    let cursor = 0;
+    poscar.species.forEach((sp, si) => {
+      const n = poscar.counts[si];
+      const vals = assigned ? assigned.slice(cursor, cursor + n) : [];
+      const flat = ncl
+        ? vals.filter(Boolean).map((v) => Math.hypot(...v))
+        : vals.filter((v) => v !== null && v !== undefined);
+      const uniq = [...new Set(flat.map((v) => v.toFixed(4)))];
+      summary.push({
+        element: sp, count: n, si,
+        range: `${cursor + 1}–${cursor + n}`,
+        uniform: uniq.length === 1 ? parseFloat(uniq[0]) : null,
+        values: flat,
+      });
+      cursor += n;
+    });
+
+    const maxAbs = ncl
+      ? Math.max(1e-9, ...poscar.atoms.map((_, i) => (assigned[i] ? Math.hypot(...assigned[i]) : 0)))
+      : Math.max(1e-9, ...assigned.map((v) => (v === null ? 0 : Math.abs(v))));
+
+    return { ncl, assigned, notes, summary, maxAbs, magmomRaw: incar.magmomRaw, expanded: incar.magmom, expected };
+  }, [poscar, incar]);
+
+  const hasInput = poscarText.trim() && incarText.trim();
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", color: C.ink, fontFamily: "'Helvetica Neue', 'Hiragino Sans', 'Noto Sans JP', sans-serif" }}>
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: "28px 20px 60px" }}>
+
+        {/* ヘッダー */}
+        <div style={{ display: "flex", alignItems: "baseline", gap: 14, flexWrap: "wrap", marginBottom: 4 }}>
+          <h1 style={{ fontFamily: mono, fontSize: 24, fontWeight: 700, margin: 0, letterSpacing: "0.02em" }}>
+            MAGMOM Inspector
+          </h1>
+          <span style={{ color: C.sub, fontSize: 13 }}>
+            INCAR の MAGMOM を POSCAR の原子順序に展開して表示
+          </span>
+        </div>
+        <p style={{ color: C.sub, fontSize: 13, margin: "6px 0 20px", lineHeight: 1.6 }}>
+          INCAR と POSCAR を貼り付けるかファイルを選択してください。<code style={{ fontFamily: mono }}>N*値</code> の繰り返し記法を展開し、
+          原子数との整合性を検証します。データはブラウザ内でのみ処理されます。
+        </p>
+
+        {/* 入力 */}
+        <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 16 }}>
+          <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+            <FilePane label="INCAR" hint={"MAGMOM = 2*4.0 2*-4.0 8*0.0\nISPIN = 2\n..."} value={incarText} onChange={setIncarText} />
+            <FilePane label="POSCAR" hint={"コメント行\n1.0\n(格子ベクトル×3)\n Fe  O\n  4  8\nDirect\n..."} value={poscarText} onChange={setPoscarText} />
+          </div>
+          <button
+            onClick={() => { setPoscarText(SAMPLE_POSCAR); setIncarText(SAMPLE_INCAR); }}
+            style={{
+              marginTop: 12, fontSize: 12.5, color: C.sub, background: "none",
+              border: `1px dashed ${C.line}`, borderRadius: 5, padding: "5px 12px", cursor: "pointer",
+            }}
+          >
+            サンプルを読み込む（Fe₃O₄ フェリ磁性）
+          </button>
+        </div>
+
+        {/* 解析結果 */}
+        {hasInput && (
+          <div style={{ marginTop: 20, display: "flex", flexDirection: "column", gap: 16 }}>
+            {!poscar.ok && <Badge kind="err">POSCAR: {poscar.error}</Badge>}
+            {!incar.ok && <Badge kind="err">INCAR: {incar.error}</Badge>}
+
+            {analysis && (
+              <>
+                {/* 検証メッセージ */}
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {analysis.notes.map((n, i) => <Badge key={i} kind={n.kind}>{n.text}</Badge>)}
+                </div>
+
+                {/* 読み取り内容の確認（診断用） */}
+                <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 16 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8, letterSpacing: "0.03em" }}>
+                    読み取った MAGMOM
+                  </div>
+                  {analysis.magmomRaw !== undefined ? (
+                    <>
+                      <div style={{
+                        fontFamily: mono, fontSize: 12, background: C.bg, border: `1px solid ${C.line}`,
+                        borderRadius: 6, padding: "8px 10px", whiteSpace: "pre-wrap", wordBreak: "break-all",
+                      }}>
+                        {analysis.magmomRaw}
+                      </div>
+                      <div style={{ fontSize: 12, color: C.sub, marginTop: 8 }}>
+                        展開後の値の数: <span style={{ fontFamily: mono, fontWeight: 700, color: C.ink }}>{analysis.expanded?.length ?? 0}</span>
+                        {"　"}必要数: <span style={{ fontFamily: mono, fontWeight: 700, color: C.ink }}>{analysis.expected}</span>
+                        {analysis.ncl ? "（3 × 原子数）" : "（原子数）"}
+                        <br />
+                        アプリの読み取りが INCAR の記述と食い違う場合は、この欄の内容と元の MAGMOM 行を比べてください。
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ fontSize: 12.5, color: C.sub }}>INCAR から MAGMOM タグを検出できませんでした。</div>
+                  )}
+                </div>
+
+                {/* 元素種ごとの要約 */}
+                <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 16 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10, letterSpacing: "0.03em" }}>
+                    元素種ごとの割り当て
+                  </div>
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                    {analysis.summary.map((s) => (
+                      <div key={s.si} style={{
+                        border: `1px solid ${C.line}`, borderTop: `3px solid ${speciesColor(s.si)}`,
+                        borderRadius: 8, padding: "10px 14px", minWidth: 150, background: "#fff",
+                      }}>
+                        <div style={{ fontFamily: mono, fontWeight: 700, fontSize: 16 }}>
+                          {s.element} <span style={{ color: C.sub, fontWeight: 400, fontSize: 12 }}>× {s.count}</span>
+                        </div>
+                        <div style={{ fontSize: 11.5, color: C.sub, marginTop: 2 }}>原子 {s.range}</div>
+                        <div style={{ fontFamily: mono, fontSize: 14, marginTop: 6 }}>
+                          {s.uniform !== null
+                            ? <>{fmt(s.uniform)} <span style={{ fontSize: 11, color: C.sub }}>μB{analysis.ncl ? "（|m|）" : ""}</span></>
+                            : s.values.length === 0
+                              ? <span style={{ color: C.sub }}>—</span>
+                              : <span style={{ color: C.warn }}>値が混在</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 3D 構造ビュー */}
+                {poscar.lattice && poscar.positions && (
+                  <StructureView poscar={poscar} assigned={analysis.assigned} ncl={analysis.ncl} />
+                )}
+
+                {/* 原子ごとの表 */}
+                <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 16, overflowX: "auto" }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10, letterSpacing: "0.03em" }}>
+                    原子ごとの MAGMOM
+                  </div>
+                  <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 13 }}>
+                    <thead>
+                      <tr style={{ color: C.sub, fontSize: 11.5, textAlign: "left" }}>
+                        <th style={{ padding: "4px 10px", fontWeight: 600 }}>#</th>
+                        <th style={{ padding: "4px 10px", fontWeight: 600 }}>元素</th>
+                        {analysis.ncl ? (
+                          <>
+                            <th style={{ padding: "4px 10px", fontWeight: 600, textAlign: "right" }}>mx</th>
+                            <th style={{ padding: "4px 10px", fontWeight: 600, textAlign: "right" }}>my</th>
+                            <th style={{ padding: "4px 10px", fontWeight: 600, textAlign: "right" }}>mz</th>
+                            <th style={{ padding: "4px 10px", fontWeight: 600, textAlign: "right" }}>|m|</th>
+                          </>
+                        ) : (
+                          <th style={{ padding: "4px 10px", fontWeight: 600, textAlign: "right" }}>MAGMOM (μB)</th>
+                        )}
+                        <th style={{ padding: "4px 10px", fontWeight: 600 }}>可視化（0 中心）</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {poscar.atoms.map((a, i) => {
+                        const v = analysis.assigned[i];
+                        const si = poscar.species.indexOf(a.element);
+                        const scalar = v === null || v === undefined ? null
+                          : analysis.ncl ? Math.hypot(...v) * Math.sign(v[2] || v[1] || v[0] || 0) : v;
+                        const missing = v === null || v === undefined;
+                        return (
+                          <tr key={i} style={{ borderTop: `1px solid ${C.line}`, background: missing ? C.err + "0D" : "transparent" }}>
+                            <td style={{ padding: "5px 10px", fontFamily: mono, color: C.sub }}>{i + 1}</td>
+                            <td style={{ padding: "5px 10px", fontFamily: mono, fontWeight: 700 }}>
+                              <span style={{
+                                display: "inline-block", width: 8, height: 8, borderRadius: 2,
+                                background: speciesColor(si), marginRight: 7, verticalAlign: "1px",
+                              }} />
+                              {a.element}
+                              <span style={{ color: C.sub, fontWeight: 400, fontSize: 11 }}> {a.indexInSpecies}</span>
+                            </td>
+                            {analysis.ncl ? (
+                              <>
+                                {[0, 1, 2].map((k) => (
+                                  <td key={k} style={{ padding: "5px 10px", fontFamily: mono, textAlign: "right" }}>
+                                    {missing ? "欠落" : fmt(v[k])}
+                                  </td>
+                                ))}
+                                <td style={{ padding: "5px 10px", fontFamily: mono, textAlign: "right", fontWeight: 700 }}>
+                                  {missing ? "—" : fmt(Math.hypot(...v))}
+                                </td>
+                              </>
+                            ) : (
+                              <td style={{
+                                padding: "5px 10px", fontFamily: mono, textAlign: "right", fontWeight: 700,
+                                color: missing ? C.err : scalar > 1e-6 ? C.up : scalar < -1e-6 ? C.down : C.zero,
+                              }}>
+                                {missing ? "欠落" : fmt(v)}
+                              </td>
+                            )}
+                            <td style={{ padding: "5px 10px" }}>
+                              {!missing && <MomentBar value={scalar} maxAbs={analysis.maxAbs} />}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  <div style={{ marginTop: 10, fontSize: 11.5, color: C.sub, display: "flex", gap: 16 }}>
+                    <span><span style={{ color: C.up, fontWeight: 700 }}>■</span> 正（↑）</span>
+                    <span><span style={{ color: C.down, fontWeight: 700 }}>■</span> 負（↓）</span>
+                    <span><span style={{ color: C.zero, fontWeight: 700 }}>●</span> 0</span>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<MagmomViewer />);
+
+</script>
+</body>
+</html>
