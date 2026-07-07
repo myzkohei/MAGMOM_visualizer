@@ -46,6 +46,10 @@ MAGMOM = 4*0 2*5 4*-5
 
 この場合、POSCAR中の原子順に従って、各原子にMAGMOMの値が割り当てられます。
 
+## 表示の例
+All-in-all-outのスピンを有するPr2Ir2O7のIrのスピン状態を表示した例です。
+![表示例](./display_example.png "サンプル")
+
 ## 注意点
 
 - MAGMOM の対応は、POSCAR中の原子順に基づいて解釈されます。
