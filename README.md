@@ -2,3 +2,5 @@
 VASPによるDFT計算で、各原子の初期モーメントはMAGMOMとしてINCARに記載し、各原子はPOSCARに記載します。
 それぞれ分かれているので、対応が突きにくい点が問題でした。そこで、Claudeにコードを書いてもらい、可視化するツールを作成しました。
 POSCARとINCARをアップロードすることで、どの原子に初期モーメントが与えられているか、一目で分かるようになります。
+
+https://myzkohei.github.io/MAGMOM_visualizer/
